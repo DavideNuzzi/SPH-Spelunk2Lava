@@ -1,0 +1,242 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel RenderFluid
+
+// Create a RenderTexture with enableRandomWrite flag and set it
+// with cs.SetTexture
+RWTexture2D<float4> Result;
+Texture2D<float4> sourceTexture;
+
+float4x4 _CameraToWorld;
+float4x4 _CameraInverseProjection;
+uint particleCount;
+uint partitionBucketCount;
+float h;
+
+struct Particle
+{
+	float mass;
+	float density;
+	float pressure;
+	uint alive;
+
+	float2 position;
+	float2 velocity;
+	float2 pressureForce;
+	float2 viscosityForce;
+};
+
+struct Ray
+{
+	float3 origin;
+	float3 direction;
+};
+
+StructuredBuffer<Particle> particleBuffer;
+Buffer <uint> particleIndexBuffer;
+Buffer <uint> cellOffsetBuffer;
+Buffer <uint> cellIndexBuffer;
+
+
+inline uint SPH_GridHash(in int2 cellIndex)
+{
+	const uint p1 = 7919; // some large primes
+	const uint p2 = 32183;
+	uint n = 5167 + p1 * cellIndex.x ^ p2 * cellIndex.y;
+	n %= partitionBucketCount;
+	return n;
+}
+
+
+Ray CreateRay(float3 origin, float3 direction)
+{
+	Ray ray;
+	ray.origin = origin;
+	ray.direction = direction;
+	return ray;
+}
+
+Ray CreateCameraRay(float2 uv)
+{
+	// Transform the camera origin to world space
+	float3 origin = mul(_CameraToWorld, float4(0.0f, 0.0f, 0.0f, 1.0f)).xyz;
+
+	// Invert the perspective projection of the view-space position
+	float3 direction = mul(_CameraInverseProjection, float4(uv, 0.0f, 1.0f)).xyz;
+	// Transform the direction from camera to world space and normalize
+	direction = mul(_CameraToWorld, float4(direction, 0.0f)).xyz;
+	direction = normalize(direction);
+	return CreateRay(origin, direction);
+}
+
+bool PlaneIntersection(float3 n, float3 p0, const float3 l0, float3 l, inout float t)
+{
+	// assuming vectors are all normalized
+	float denom = dot(n, l);
+	if (denom > 1e-6) {
+		float3 p0l0 = p0 - l0;
+		t = dot(p0l0, n) / denom;
+		return (t >= 0);
+	}
+
+	return false;
+}
+
+float3 BackgroundMask(float3 col)
+{
+	if (col.x + col.y + col.z < 0.5) return float3(1,1,1);
+	else return float3(0,0,0);
+
+}
+
+float3 GaussianBlur(int3 id)
+{
+	float Pi = 6.28318530718; 
+	float Directions = 16.0; // BLUR DIRECTIONS (Default 16.0 - More is better but slower)
+	float Quality = 4.0; // BLUR QUALITY (Default 4.0 - More is better but slower)
+	float Size = 16.0; // BLUR SIZE (Radius)
+
+	float3 col = BackgroundMask(sourceTexture[id.xy]);
+
+	// Blur calculations
+	for (float d = 0.0; d < Pi; d += Pi / Directions)
+	{
+		for (float i = 1.0 / Quality; i <= 1.0; i += 1.0 / Quality)
+		{
+			col += BackgroundMask(sourceTexture[id.xy + int2(cos(d) * Size * i, sin(d) * Size * i)]);
+		}
+	}
+
+	// Output to screen
+	col /= Quality * Directions - 15.0;
+	return col;
+
+}
+float3 DrawFluid(Ray r, uint3 id)
+{
+	// A partire dal raggio cerco l'intersezione di questo con il piano XY
+	float intersectDistance = 0;
+	bool intersectsPlane = PlaneIntersection(float3(0, 0, 1), float3(0, 0, 0), r.origin, r.direction, intersectDistance);
+
+	if (intersectsPlane)
+	{
+		float2 intersectPoint = float2(r.origin.x + r.direction.x * intersectDistance, r.origin.y + r.direction.y * intersectDistance);
+		
+		float metaball = 0;
+		float interpDensity = 0;
+		float2 interpVelocity = 0;
+		float2 interpViscosityForce = 0;
+		float2 interpPressureForce = 0;
+		float2 interpPressure = 0;
+
+		float sumWeights = 0;
+
+		// iterate through particles in the neighbour cell (if iterator offset is valid)
+				
+		int2 cellIndex = floor(intersectPoint / h);
+
+		for (int i = -1; i <= 1; ++i)
+		{
+			for (int j = -1; j <= 1; ++j)
+			{
+				int2 neighborIndex = cellIndex + int2(i, j);
+				uint flatNeighborIndex = SPH_GridHash(neighborIndex);
+
+
+				// look up the offset to the cell:
+				uint neighborIterator = cellOffsetBuffer[flatNeighborIndex];
+
+
+				while (neighborIterator != 0xFFFFFFFF && neighborIterator < particleCount)
+				{
+					if (cellIndexBuffer[neighborIterator] != flatNeighborIndex)
+					{
+						break;
+					}
+
+					uint particleIndex = particleIndexBuffer[neighborIterator];
+					Particle particle = particleBuffer[particleIndex];
+
+					if (particle.alive == 1)
+					{
+						float2 diff = particle.position - intersectPoint;
+						float dist2 = dot(diff, diff);
+
+						float r4 = dist2 * dist2;
+						const float r0 = 0.05/0.5f;
+
+						metaball += pow(r0, 4) / r4;
+
+						sumWeights += 1.0/ r4;
+						interpVelocity += particle.velocity / r4;
+						interpDensity += particle.density / r4;
+						interpViscosityForce += particle.viscosityForce / r4;
+						interpPressureForce += particle.pressureForce / r4;
+						interpPressure += particle.pressure / r4;
+					}
+
+
+					neighborIterator++;  // iterate...
+
+				}
+			}
+		}
+		
+
+		float fac = (metaball - 2.0) / 100.0;
+		if (fac > 1) fac = 1;
+
+
+		float fluidMask = 0;
+		if (metaball >= 2) fluidMask = 1;
+
+		interpVelocity = interpVelocity / sumWeights;
+		interpDensity = interpDensity / sumWeights;
+		interpViscosityForce = interpViscosityForce / sumWeights;
+		interpPressureForce = interpPressureForce / sumWeights;
+		interpPressure = interpPressure / sumWeights;
+
+		if (sumWeights == 0) interpDensity = 0;
+
+		float velFac = sqrt(dot(interpVelocity, interpVelocity)) / 4.0;
+		float viscFac = sqrt(dot(interpViscosityForce, interpViscosityForce)) / 4.0;
+		float pressForceFac = sqrt(dot(interpPressureForce, interpPressureForce)) / 20.0;
+		float densityFac = min(interpDensity /1.5 ,1);
+		float pressFac = sqrt(dot(interpPressure, interpPressure)) / 20.0;
+
+
+		// Da fare solo dietro al fluido
+		float3 backgroundUnder = GaussianBlur(id);
+
+		float3 col = float3(1, 0.7, 0);
+		float3 col2 = float3(1, 0.2, 0);
+		float3 finalCol = col * densityFac + col2 * (1 - densityFac);
+		float3 light = col * metaball * (1 - fluidMask);
+
+
+		return (backgroundUnder.x + 0.9) * finalCol  * fluidMask + (1 - fluidMask) * sourceTexture[id.xy] + 0.3*light;
+	}
+
+	return sourceTexture[id.xy];
+
+
+
+}
+
+[numthreads(8, 8, 1)]
+void RenderFluid(uint3 id : SV_DispatchThreadID)
+{
+
+	// Get the dimensions of the RenderTexture
+	uint width, height;
+	Result.GetDimensions(width, height);
+
+	// Transform pixel to [-1,1] range
+	float2 uv = float2((id.xy) / float2(width, height) * 2.0f - 1.0f);
+
+	// Get a ray for the UVs
+	Ray ray = CreateCameraRay(uv);
+
+	Result[id.xy] = float4(DrawFluid(ray,id), 1);
+
+
+}

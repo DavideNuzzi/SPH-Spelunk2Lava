@@ -1,0 +1,416 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel ComputeDensityAndPressure
+#pragma kernel ComputeForces
+#pragma kernel UpdateParticles
+#pragma kernel GetCellIndex
+#pragma kernel SortIndexList
+#pragma kernel ResetOffsetList
+#pragma kernel GetOffsetList
+
+//#pragma kernel SortIndexList
+//#pragma kernel CopySortedList
+//#pragma kernel CopyUnsortedList
+
+
+#define THREADCOUNT 256
+
+uint particleCount;
+float h;
+float h2;
+float Poly6_constant;
+float Spiky_constant;
+float rho0;
+float K;
+float dt;
+float2 G;
+float viscosity;
+
+uint sortIteration;
+uint partitionBucketCount;
+uint wallsCount;
+
+struct Particle
+{
+	float mass;
+	float density;
+	float pressure;
+	uint alive;
+
+	float2 position;
+	float2 velocity;
+	float2 pressureForce;
+	float2 viscosityForce;
+};
+
+struct Wall
+{
+	float2 origin;
+	float2 size;
+};
+
+RWStructuredBuffer<Particle> particleBuffer;
+RWBuffer <uint> particleIndexBuffer;
+RWBuffer <uint> cellIndexBuffer;
+RWBuffer <uint> cellIndexBufferSorted;
+RWBuffer <uint> particleIndexBufferSorted;
+RWBuffer <uint> cellOffsetBuffer;
+Buffer<Wall> wallsBuffer;
+
+inline uint SPH_GridHash(in int2 cellIndex)
+{
+	const uint p1 = 7919; // some large primes
+	const uint p2 = 32183;
+	uint n = 5167 + p1 * cellIndex.x ^ p2 * cellIndex.y;
+	n %= partitionBucketCount;
+	return n;
+}
+
+[numthreads(THREADCOUNT, 1, 1)]
+void GetCellIndex(uint3 id : SV_DispatchThreadID)
+{
+	if (id.x < particleCount)
+	{
+		// L'id cicla sull'array che suppongo GIA' ORDINATO
+		// Lo uso per vedere di quale particella si parla
+		uint particleIndex = particleIndexBuffer[id.x];
+		Particle particle = particleBuffer[particleIndex];
+
+		// Grid cell is of size [SPH smoothing radius], so position is refitted into that
+		int2 cellIndex = floor(particle.position / h);
+
+		// Uso l'hash per ottenere un indice univoco per la cella
+		uint flatCellIndex = SPH_GridHash(cellIndex);
+
+		// Lo salvo nel cellIndexBuffer		
+		cellIndexBuffer[id.x] = flatCellIndex;
+	}
+}
+
+
+[numthreads(THREADCOUNT, 1, 1)]
+void ResetOffsetList(uint3 id : SV_DispatchThreadID)
+{
+	cellOffsetBuffer[id.x] = 0xFFFFFFFF;
+}
+
+
+[numthreads(THREADCOUNT, 1, 1)]
+void GetOffsetList(uint3 id : SV_DispatchThreadID)
+{
+	if (id.x < particleCount)
+	{
+		//uint particleIndex = particleIndexBuffer[id.x];  // particleIndexBuffer ora è ordinato in base a cellIndexBuffer
+		//uint cellIndex = cellIndexBuffer[particleIndex];
+		uint cellIndex = cellIndexBuffer[id.x];
+
+		InterlockedMin(cellOffsetBuffer[cellIndex], id.x);
+	}
+}
+
+[numthreads(THREADCOUNT,1,1)]
+void ComputeDensityAndPressure(uint3 id : SV_DispatchThreadID)
+{
+
+	// Questa è la particella che sto considerando in questo momento
+	uint particleIndex = particleIndexBuffer[id.x];
+
+
+	if (particleIndex < particleCount)
+	{
+
+		Particle particleA = particleBuffer[particleIndex];
+
+		// Inizializzo la densità
+		particleA.density = 0;
+
+		int2 cellIndex = floor(particleA.position / h);
+
+		for (int i = -1; i <= 1; ++i)
+		{
+			for (int j = -1; j <= 1; ++j)
+			{
+				int2 neighborIndex = cellIndex + int2(i, j);
+				uint flatNeighborIndex = SPH_GridHash(neighborIndex);
+
+				// look up the offset to the cell:
+				uint neighborIterator = cellOffsetBuffer[flatNeighborIndex];
+
+				// iterate through particles in the neighbour cell (if iterator offset is valid)
+				while (neighborIterator != 0xFFFFFFFF && neighborIterator < particleCount)
+				{
+					uint particleIndexB = particleIndexBuffer[neighborIterator];
+					if (cellIndexBuffer[neighborIterator] != flatNeighborIndex)
+					{
+						break;  // it means we stepped out of the neighbour cell list!
+					}
+
+					// Here you can load particleB and do the SPH evaluation logic
+					Particle particleB = particleBuffer[particleIndexB];
+
+					// Valuto la nuova densità con SPH
+					const float2 diff = particleA.position - particleB.position;
+					const float r2 = dot(diff, diff);
+
+					if (r2 < h2)
+					{
+						const float W = Poly6_constant * pow(h2 - r2, 3);
+						particleA.density += particleB.mass * W;
+
+					//	particleA.density += 1;
+					}
+					neighborIterator++;  // iterate...
+				}
+			}
+		}
+
+
+		// Compute pressure:
+		particleA.pressure = max(0, K * (particleA.density - rho0));
+
+		// Riassegno il valore
+		particleBuffer[particleIndex] = particleA;
+
+	}
+}
+
+[numthreads(THREADCOUNT, 1, 1)]
+void ComputeForces(uint3 id : SV_DispatchThreadID)
+{
+
+	// Questa è la particella che sto considerando in questo momento
+	uint particleIndex = particleIndexBuffer[id.x];
+	Particle particleA = particleBuffer[particleIndex];
+
+
+	if (particleIndex < particleCount && particleA.alive == 1)
+	{
+		// Inizializzo la forza di pressione
+		particleA.pressureForce = 0;
+		particleA.viscosityForce = 0;
+
+		int2 cellIndex = floor(particleA.position / h);
+
+		for (int i = -1; i <= 1; ++i)
+		{
+			for (int j = -1; j <= 1; ++j)
+			{
+				int2 neighborIndex = cellIndex + int2(i, j);
+				uint flatNeighborIndex = SPH_GridHash(neighborIndex);
+
+				// look up the offset to the cell:
+				uint neighborIterator = cellOffsetBuffer[flatNeighborIndex];
+
+				// iterate through particles in the neighbour cell (if iterator offset is valid)
+				while (neighborIterator != 0xFFFFFFFF && neighborIterator < particleCount)
+				{
+					uint particleIndexB = particleIndexBuffer[neighborIterator];
+					if (cellIndexBuffer[neighborIterator] != flatNeighborIndex)
+					{
+						break;  // it means we stepped out of the neighbour cell list!
+					}
+
+					// Here you can load particleB and do the SPH evaluation logic	
+					if (particleIndexB != particleIndex)
+					{
+
+						Particle particleB = particleBuffer[particleIndexB];
+
+						const float2 diff = particleA.position - particleB.position;
+						const float r2 = dot(diff, diff);
+						const float r = sqrt(r2);
+
+						if (r > 0 && r < h)
+						{
+							const float2 rNorm = diff / r;
+							const float W1 = Spiky_constant * pow(h - r, 2);
+
+							particleA.pressureForce -= particleB.mass * ((particleA.pressure + particleB.pressure) / (2 * particleB.density)) * W1 * rNorm;
+
+
+							const float r3 = r2 * r;
+							const float W2 = -Spiky_constant * (h - r);
+
+							particleA.viscosityForce += (particleB.mass / particleB.density) * (particleB.velocity - particleA.velocity) * W2;
+
+						}
+					}
+					neighborIterator++;  // iterate...
+				}
+			}
+		}
+
+		particleA.viscosityForce *= viscosity;
+		particleBuffer[particleIndexBuffer[id.x]] = particleA;
+
+	}
+
+}
+
+bool ResolveCollisions(inout Particle p, Wall w)
+{
+	if (p.position.x > w.origin.x - w.size.x / 2.0 && p.position.x < w.origin.x + w.size.x / 2.0 &&
+		p.position.y > w.origin.y - w.size.y / 2.0 && p.position.y < w.origin.y + w.size.y / 2.0)
+	{
+
+		float top = w.origin.y + w.size.y / 2.0;
+		float bottom = w.origin.y - w.size.y / 2.0;
+		float right = w.origin.x + w.size.x / 2.0;
+		float left = w.origin.x - w.size.x / 2.0;
+
+		float4 dist = 0;
+
+		dist.x = abs(top - p.position.y);
+		dist.y = abs(bottom - p.position.y);
+		dist.z = abs(right - p.position.x);
+		dist.w = abs(left - p.position.x);
+
+		if (dist.x < dist.y && dist.x < dist.z && dist.x < dist.w)
+		{
+			p.position.y = top;
+			p.velocity.y *= -0.5;
+		}
+
+		if (dist.y < dist.x && dist.y < dist.z && dist.y < dist.w)
+		{
+			p.position.y = bottom;
+			p.velocity.y *= -0.5;
+		}
+
+		if (dist.z < dist.x && dist.z < dist.y && dist.z < dist.w)
+		{
+			p.position.x = right;
+			p.velocity.x *= -0.5;
+		}
+
+		if (dist.w < dist.x && dist.w < dist.y && dist.w < dist.z)
+		{
+			p.position.x = left;
+			p.velocity.x *= -0.5;
+		}
+
+	}
+	return false;
+}
+
+[numthreads(THREADCOUNT, 1, 1)]
+void UpdateParticles(uint3 id : SV_DispatchThreadID)
+{
+
+	Particle particleA = particleBuffer[particleIndexBuffer[id.x]];
+
+	if (id.x < particleCount && particleA.alive == 1)
+	{
+		particleA.velocity += dt * ((particleA.pressureForce + particleA.viscosityForce) / particleA.density + G);
+		particleA.position += dt * particleA.velocity;
+
+		for (uint i = 0; i < wallsCount; i++)
+		{
+			Wall wall = wallsBuffer[i];
+
+			bool collision = ResolveCollisions(particleA, wall);
+			if (collision) break;
+		}
+
+		particleBuffer[particleIndexBuffer[id.x]] = particleA;
+	}
+}
+
+
+
+
+
+
+
+/*
+[numthreads(THREADCOUNT, 1, 1)]
+void SortIndexList(uint3 id : SV_DispatchThreadID)
+{
+	if (id.x < particleCount)
+	{
+		uint particleIndex = particleIndexBuffer[id.x];
+		uint cellIndex = cellIndexBuffer[id.x];
+
+		if ((sortIteration % 2 == 0 && id.x % 2 == 0) || (sortIteration % 2 != 0 && id.x % 2 != 0))
+		{
+			// Max operation
+			if (id.x > 0)
+			{
+				// Vedo il valore a sinistra
+				uint cellIndexLeft = cellIndexBuffer[id.x - 1];
+
+				// Se è maggiore di quello che sto considerando, swappa
+				if (cellIndexLeft > cellIndex)
+				{
+					cellIndexBufferSorted[id.x] = cellIndexLeft;
+					particleIndexBufferSorted[id.x] = particleIndexBuffer[id.x - 1];
+				}
+				else
+				{
+					cellIndexBufferSorted[id.x] = cellIndex;
+					particleIndexBufferSorted[id.x] = particleIndex;
+				}
+			}
+		}
+		else
+		{
+			// Max operation
+			if (id.x < particleCount - 1)
+			{
+				uint cellIndexRight = cellIndexBuffer[id.x + 1]; // Right
+
+				// Se è maggiore di quello che sto considerando, swappa
+				if (cellIndexRight < cellIndex)
+				{
+					cellIndexBufferSorted[id.x] = cellIndexRight;
+					particleIndexBufferSorted[id.x] = particleIndexBuffer[id.x + 1];
+				}
+				else
+				{
+					cellIndexBufferSorted[id.x] = cellIndex;
+					particleIndexBufferSorted[id.x] = particleIndex;
+				}
+			}
+		}
+	}
+}
+
+
+
+
+[numthreads(THREADCOUNT, 1, 1)]
+void BitonicMerge(uint3 id : SV_DispatchThreadID)
+{
+	/*
+	int step = n / 2, i, j, k, temp;
+	while (step > 0) {
+		for (i = 0; i < n; i += step * 2) {
+			for (j = i, k = 0; k < step; j++, k++) {
+				if (arr[j] > arr[j + step]) {
+					// swap
+					temp = arr[j];
+					arr[j] = arr[j + step];
+					arr[j + step] = temp;
+				}
+			}
+		}
+		step /= 2;
+	}
+
+}
+
+
+[numthreads(THREADCOUNT, 1, 1)]
+void CopySortedList(uint3 id : SV_DispatchThreadID)
+{
+		cellIndexBuffer[id.x] = cellIndexBufferSorted[id.x];
+		particleIndexBuffer[id.x] = particleIndexBufferSorted[id.x];
+}
+
+[numthreads(THREADCOUNT, 1, 1)]
+void CopyUnsortedList(uint3 id : SV_DispatchThreadID)
+{
+
+	cellIndexBufferSorted[id.x] = cellIndexBuffer[id.x];
+	particleIndexBufferSorted[id.x] = particleIndexBuffer[id.x];
+}
+*/

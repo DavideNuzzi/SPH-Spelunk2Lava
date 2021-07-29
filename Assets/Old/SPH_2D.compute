@@ -1,0 +1,151 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel ComputeDensityAndPressure
+#pragma kernel ComputeForces
+#pragma kernel UpdateParticles
+
+#define THREADCOUNT 128
+
+uint particleCount;
+float h;
+float h2;
+float h3;
+float Poly6_constant;
+float Spiky_constant;
+float rho0;
+float K;
+float dt;
+float2 G;
+float viscosity;
+
+struct Particle
+{
+	float mass;
+	float density;
+	float pressure;
+	uint isSolid;
+
+	float2 position;
+	float2 velocity;
+	float2 pressureForce;
+	float2 viscosityForce;
+};
+
+RWStructuredBuffer<Particle> particleBuffer;
+
+
+[numthreads(THREADCOUNT,1,1)]
+void ComputeDensityAndPressure(uint3 id : SV_DispatchThreadID)
+{
+	// Questa è la particella che sto considerando in questo momento
+	Particle particleA = particleBuffer[id.x];
+
+	// Inizializzo la densità
+	particleA.density = 0;
+
+	// Ciclo su tutte le altre, compresa lei
+	for (uint i = 0; i < particleCount; ++i)
+	{
+		Particle particleB = particleBuffer[i];
+
+		// Valuto la nuova densità con SPH
+		const float2 diff = particleA.position - particleB.position;
+		const float r2 = dot(diff, diff);
+
+		if (r2 < h2)
+		{
+			const float W = Poly6_constant * pow(h2 - r2, 3);
+			particleA.density += particleB.mass * W;
+		}
+	}
+
+
+	// Compute pressure:
+	particleA.pressure = max(0, K * (particleA.density - rho0));
+
+	// Riassegno il valore
+	particleBuffer[id.x] = particleA;
+
+
+}
+
+[numthreads(THREADCOUNT, 1, 1)]
+void ComputeForces(uint3 id : SV_DispatchThreadID)
+{
+	Particle particleA = particleBuffer[id.x];
+
+	if (particleA.isSolid == 0)
+	{
+		// Inizializzo la forza di pressione
+		particleA.pressureForce = 0;
+		particleA.viscosityForce = 0;
+
+		// Ciclo su tutte le altre particelle ESCLUSA questa
+		for (uint i = 0; i < particleCount; ++i)
+		{
+			if (i == id.x) continue;
+			
+			Particle particleB = particleBuffer[i];
+
+			const float2 diff = particleA.position - particleB.position;
+			const float r2 = dot(diff, diff);
+			const float r = sqrt(r2);
+
+			if (r > 0 && r < h)
+			{
+				const float2 rNorm = diff / r;
+				const float W1 = Spiky_constant * pow(h - r, 2);
+
+				particleA.pressureForce -= particleB.mass * ((particleA.pressure + particleB.pressure) / (2 * particleB.density)) * W1 * rNorm;
+
+
+				const float r3 = r2 * r;
+				const float W2 = -Spiky_constant * (h - r);
+
+				particleA.viscosityForce += (particleB.mass / particleB.density) * (particleB.velocity - particleA.velocity) * W2;
+
+			}
+		}
+
+		particleA.viscosityForce *= viscosity;
+
+		particleBuffer[id.x] = particleA;
+	}
+}
+
+
+[numthreads(THREADCOUNT, 1, 1)]
+void UpdateParticles(uint3 id : SV_DispatchThreadID)
+{
+	Particle particleA = particleBuffer[id.x];
+
+	if (particleA.isSolid == 0)
+	{
+
+		particleA.velocity += dt * ((particleA.pressureForce + particleA.viscosityForce) / particleA.density + G);
+		particleA.position += dt * particleA.velocity;
+		//particleA.pressureForce = 0;
+		//particleA.viscosityForce = 0;
+
+
+		if (particleA.position.y + 0.01f < 0)
+		{
+			particleA.position.y = 0;
+			particleA.velocity.y *= -0.5;
+		}
+
+
+		if (particleA.position.x + 0.01f < 0)
+		{
+			particleA.position.x = 0;
+			particleA.velocity.x *= -0.5;
+		}
+
+		if (particleA.position.x - 0.01f > 3)
+		{
+			particleA.position.x = 3;
+			particleA.velocity.x *= -0.5;
+		}
+
+		particleBuffer[id.x] = particleA;
+	}
+}
